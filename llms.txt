@@ -1,0 +1,345 @@
+# focket-rs Reference
+
+focket-rs is a minimal **node-graph / workflow orchestration engine** for Rust — a port
+of the TypeScript focketplow library. It provides a single durable primitive — a
+`prep -> exec -> post` node wired into a directed graph — plus async-first (tokio)
+execution, a hooks layer for tracing/recovery, retries, timeouts, cancellation, bounded
+parallelism, and a cycle guard. It is NOT a batteries-included agent framework: there is
+no LLM client, tool-calling, streaming, or memory. Bring those and compose them inside
+nodes.
+
+Tags: workflow, node-graph, orchestration, async, rust, tokio, flow-control, pipeline
+
+## Install
+
+```bash
+cargo add focket-rs
+```
+
+## Mental model
+
+- A **node** implements the `FlowNode` trait over a struct embedding a `NodeCore`:
+  - `prep(&self, shared: &mut Shared) -> Result<Value>` -> data for `exec`
+  - `exec(&self, prep_res: &Value) -> Result<Value>` -> data for `post` (the retried phase)
+  - `post(&self, shared: &mut Shared, prep_res: &Value, exec_res: &Value) -> Result<Action>`
+- An **Action** (`Option<String>`) selects the next edge: `None` = default edge;
+  `Some(name)` = the edge registered with `.on(name).to(node)`. No matching edge =
+  clean termination.
+- **`Shared`, params, and lifecycle values are `serde_json::Value`** (TS generics are
+  erased at runtime; a `Value` deep-clone is the analogue of `structuredClone`).
+  `shared` is the value you pass to `flow.run(&mut shared, ...)` — that exact same
+  mutable value is forwarded to every node's `prep()`/`post()`. (For isolated
+  primitives like `ForkJoin`/`Subflow`/parallel `BatchFlow`, each unit gets its own
+  clone.) **`params`** is node config: a Flow propagates its params to every node as
+  defaults, and a node's own params (set via `node.set_params(...)`) merge ON TOP
+  (never clobbered). BatchFlow bundles layer in below a node's own params.
+- Nodes are used behind `NodeRef = Arc<dyn FlowNode>`.
+
+## Defining a node
+
+```rust
+use async_trait::async_trait;
+use focket_rs::*;
+use serde_json::{json, Value};
+
+#[derive(Clone)]                                   // required (graph cloning)
+struct Greet { core: NodeCore }
+
+#[async_trait]
+impl FlowNode for Greet {
+    impl_node_core!(core);                         // generates core() + clone_node()
+
+    async fn prep(&self, shared: &mut Shared) -> Result<Value> {
+        Ok(shared["name"].clone())
+    }
+    async fn exec(&self, name: &Value) -> Result<Value> {
+        Ok(json!(format!("hello, {}", name.as_str().unwrap())))
+    }
+    async fn post(&self, shared: &mut Shared, _p: &Value, out: &Value) -> Result<Action> {
+        shared["greeting"] = out.clone();
+        Ok(None)                                   // follow the default edge
+    }
+}
+```
+
+## The node kinds
+
+| TS class | Rust | Role |
+|----------|------|------|
+| `BaseNode` / `Node` | `impl FlowNode` + `NodeCore` | Lifecycle + wiring + retry (`max_retries`, `wait_ms`, `exec_fallback`). |
+| `BatchNode` | `FlowNode` + `NodeOpts::batch()` | Processes `prep()`'s array item-by-item via `exec_item()`. Options: `concurrency`, `fail_fast`. |
+| `Flow` | `Flow` / `Flow<B: FlowOps>` | Orchestrates a graph. Hooks (`use_hooks`), cycle guard (`max_steps`), nestable. |
+| `BatchFlow` | `BatchFlow<B: BatchFlowOps>` | Runs its sub-flow once per bundle from `prep()`. Options: `concurrency`, `fail_fast`. |
+| `Subflow` | `Subflow<B: SubflowOps>` | Runs a nested flow over an **isolated** derived context; folds back via `reduce()`. |
+| `ForkJoin` | `ForkJoin<B: ForkJoinOps>` | Fans out to N **distinct** branch nodes in parallel (isolated shareds); `join()`s. |
+
+(The TS `BaseNode`/`Node`/`BatchNode` classes collapse into one `FlowNode` trait —
+a `BaseNode` is observably a node with `max_retries: 0` and the default rethrowing
+`exec_fallback`; retry and batch behavior come from `NodeOpts`.)
+
+## Wiring a graph
+
+```rust
+let a: NodeRef = Arc::new(NodeA { core: NodeCore::named("A") });
+let b: NodeRef = Arc::new(NodeB { core: NodeCore::named("B") });
+a.next(b.clone());                  // default edge (action = None)
+a.on("retry").to(a.clone());        // conditional edge
+let flow = Flow::new(a);
+let mut shared = json!({ "name": "world" });
+flow.run(&mut shared, None).await?; // async-first entry point
+```
+
+- `next(node)` / `next_action(node, action)` / `on(action).to(node)` all return the
+  target node for chaining.
+- `node.set_params(json!({...}))` sets the node's own params (they win over flow params).
+- Run a bare node in isolation via `NodeRunExt`: `node_ref.run(&mut shared, None).await`
+  (successors are ignored — use a Flow to traverse them).
+
+## Retries (fixed semantics)
+
+`max_retries` is retries AFTER the first attempt. Total attempts = `1 + max_retries`.
+Default `0` = single attempt. On final failure, `exec_fallback(prep_res, error)` runs
+(default: rethrow). `wait_ms` delays between retries. Cancellation is never retried.
+
+```rust
+#[async_trait]
+impl FlowNode for Flaky {
+    impl_node_core!(core);
+    async fn exec(&self, req: &Value) -> Result<Value> { /* retried up to 3 times */ }
+    async fn exec_fallback(&self, req: &Value, err: FlowError) -> Result<Value> { /* last resort */ }
+}
+// core: NodeCore::with_opts(NodeOpts::new().max_retries(3).wait_ms(1000))
+```
+
+## Hooks (tracing, metrics, error recovery)
+
+```rust
+struct MyHooks;
+#[async_trait]
+impl Hooks for MyHooks {
+    async fn on_start(&self, shared: &Shared) -> Result<()> { Ok(()) }
+    async fn on_node_start(&self, ctx: NodeHookCtx<'_>) -> Result<Action> {
+        // Return Some("action") to GATE the node (see below); None to run it.
+        Ok(None)
+    }
+    async fn on_node_end(&self, ctx: NodeEndCtx<'_>) -> Result<()> {
+        // ctx: node, shared, path, action, duration_ms, skipped, error
+        Ok(())
+    }
+    async fn on_retry(&self, ctx: RetryCtx<'_>) -> Result<()> {
+        // ctx: node, shared, path, error, attempt, wait_ms
+        Ok(())
+    }
+    async fn on_error(&self, ctx: ErrorCtx<'_>) -> Result<Option<ErrorPolicy>> {
+        // Route to a recovery node (skips post()), or Throw/None to propagate.
+        Ok(Some(ErrorPolicy::Route("recover".to_string())))
+    }
+    async fn on_end(&self, shared: &Shared, action: &Action) -> Result<()> { Ok(()) }
+}
+flow.use_hooks(Arc::new(MyHooks));
+```
+
+Multiple `use_hooks()` calls compose: side-effecting hooks fan out in registration
+order; routing hooks are first-wins (`on_node_start`'s gate — all still run;
+`on_error`'s route — short-circuits). Note: hooks receive `&Shared` (read-only).
+
+### Human-in-the-loop gates
+
+`on_node_start` may **return an action** to gate a node: its `prep`/`exec`/`post` are
+skipped and the flow routes via that action's edge. Returning `None` runs the node
+normally. `on_node_end` still fires with `skipped: true`. This is the approval/HITL
+seam. Returning a route from `on_error` turns a failed `exec` into a routing decision
+instead of a crash.
+
+## Parallelism
+
+Batch nodes (`NodeOpts::batch()`) and `BatchFlow` options:
+
+- `concurrency` (default `1`): `1` = sequential, `>1` = bounded parallel. Order preserved.
+- `fail_fast` (default `false`): `false` = all-settled style (failed items become `null`
+  and fire `on_error`; the rest finish); `true` = cancel in-flight siblings on the first
+  failure and throw.
+
+```rust
+#[async_trait]
+impl FlowNode for Enrich {
+    impl_node_core!(core);
+    async fn prep(&self, shared: &mut Shared) -> Result<Value> {
+        Ok(shared["items"].clone())             // an array
+    }
+    async fn exec_item(&self, item: &Value, sig: &CancellationToken) -> Result<Value> {
+        enrich(item, sig).await                  // pass sig to I/O for cooperative cancel
+    }
+}
+// core: NodeCore::with_opts(NodeOpts::batch().concurrency(8).fail_fast(false))
+```
+
+`BatchFlow` with `concurrency > 1` is **isolated**: each bundle runs over its own cloned
+`shared` **and** a freshly cloned node graph (so concurrent bundles can't race on shared
+state or node `params`). Fold results back by overriding
+`BatchFlowOps::merge(parent, bundle_shareds)`. At `concurrency == 1`, bundles accumulate
+into the single real `shared`.
+
+```rust
+#[derive(Clone)]
+struct Bundles;
+#[async_trait]
+impl BatchFlowOps for Bundles {
+    async fn prep(&self, _s: &mut Shared) -> Result<Value> {
+        Ok(json!([{ "id": "a" }, { "id": "b" }])) // each object merges into params
+    }
+    async fn merge(&self, parent: &mut Shared, bundle_shareds: &[Shared]) -> Result<()> {
+        Ok(())
+    }
+}
+// NOTE: BatchFlow::run takes an Arc receiver (its hooks reference it as a node):
+let bf = Arc::new(BatchFlow::with_ops(start_node, Bundles).with_concurrency(3));
+bf.run(&mut shared, None).await?;
+```
+
+## Parallel delegation: ForkJoin
+
+`ForkJoin` fans out to N **distinct** branch nodes concurrently (bounded by
+`concurrency`; `0` = all; `fail_fast` default false), each over its own isolated copy of
+`shared`, then calls `join(shared, branch_shareds)` to merge. This is the primitive for
+"delegate to parallel sub-agents, then synthesize" (e.g. a deep-research agent).
+
+```rust
+#[derive(Clone)]
+struct FanOut;
+#[async_trait]
+impl ForkJoinOps for FanOut {
+    async fn join(&self, shared: &mut Shared, bs: &[Option<Shared>]) -> Result<()> {
+        let findings: Vec<Value> = bs.iter().flatten()
+            .flat_map(|b| b["findings"].as_array().unwrap().clone())
+            .collect();
+        shared["findings"] = Value::Array(findings);
+        Ok(())
+    }
+}
+let fan: NodeRef = Arc::new(ForkJoin::with_ops(
+    vec![research_agent("RAG"), research_agent("fine-tuning")],
+    FanOut,
+).with_concurrency(2));
+Flow::new(fan).run(&mut initial, None).await?;
+```
+
+Each branch runs its own full lifecycle (hooks fire per branch; HITL gates work per
+branch; retry applies). Branches are isolated and can't clobber one another. **Each
+branch must be a distinct instance** — concurrent lifecycles on one instance race.
+
+## Isolated sub-contexts: Subflow
+
+`Subflow` runs a nested flow over a context **derived** from the parent `shared` and
+folds only what you choose back via `reduce()` — the "subagent with isolated context"
+primitive.
+
+```rust
+#[derive(Clone)]
+struct MySub;
+#[async_trait]
+impl SubflowOps for MySub {
+    async fn derive_shared(&self, parent: &Shared, _c: Option<&SharedCloner>) -> Result<Shared> {
+        Ok(json!({ "query": parent["question"], "findings": [] }))
+    }
+    async fn reduce(&self, sub: &Shared, parent: &mut Shared) -> Result<()> {
+        parent["answer"] = sub["findings"].clone();
+        Ok(())
+    }
+}
+let sub: NodeRef = Arc::new(Subflow::with_ops(nested_flow, MySub));
+Flow::new(sub).run(&mut json!({ "question": "…" }), None).await?;
+```
+
+Default `derive_shared` (ops = `()`) clones the parent `shared`; the sub-flow inherits
+the parent's hooks (tracing continuity) and is retried per the Subflow's
+`max_retries`/`wait_ms`. Retries start from a freshly derived context per attempt.
+
+## Cycle guard
+
+`Flow::new(start).with_max_steps(50)` (default 1000). Exceeding the budget fails with
+`FlowError::Cycle { max_steps }` instead of hanging. Useful for LLM-driven routing loops.
+
+## Timeouts
+
+`max_steps` bounds step count, not wall-clock. A node's `timeout_ms` (a `NodeOpts`
+field) races the whole `prep→exec→post` lifecycle; on expiry `FlowError::Timeout` goes
+through `on_error` (so it's routable to a recovery node). `timeout_ms: 0` (default) =
+no timeout. A node that loses the race never runs `post()`.
+
+```rust
+let fetch: NodeRef = Arc::new(Fetch {
+    core: NodeCore::with_opts(NodeOpts::new().timeout_ms(5000)),
+});
+fetch.on("timeout").to(fallback);
+// on_error: match ctx.error { FlowError::Timeout{..} => Route("timeout"), _ => None }
+```
+
+## Cancellation
+
+`flow.run(&mut shared, Some(token))` / `node_ref.run(&mut shared, Some(token))` accept a
+`tokio_util::sync::CancellationToken`. Cancelling fails the run with
+`FlowError::Aborted`, propagated from wherever execution was. `fail_fast: true` cancels
+in-flight siblings via a shared child token. For cooperative cancellation, read
+`self.signal()` (or the `sig` passed to `exec_item`) and `tokio::select!` on it in your
+I/O. `FlowError::Aborted` is terminal: bypasses `on_error`, never retried.
+
+```rust
+let tok = CancellationToken::new();
+let t2 = tok.clone();
+tokio::spawn(async move { sleep(Duration::from_secs(30)).await; t2.cancel(); });
+flow.run(&mut shared, Some(tok)).await // Err(FlowError::Aborted) on cancel
+```
+
+## Nesting
+
+A `Flow` is a `FlowNode`: use it inside another flow (`Arc::new(Flow::new(...))` as a
+`NodeRef`). Hooks compose (the nested flow's own first, then the parent's); each flow
+has its own `max_steps` budget.
+
+## Error types
+
+One enum, `FlowError`:
+
+- `FlowError::Flow(String)` — engine misuse (e.g. "Flow has no start node").
+- `FlowError::Cycle { max_steps }` — `max_steps` budget exceeded.
+- `FlowError::Timeout { timeout_ms }` — node's `timeout_ms` exceeded. Routable via
+  `on_error` (`.timeout_ms()` accessor).
+- `FlowError::Aborted` — cancellation (token cancel or `fail_fast` sibling cancel).
+  Terminal: bypasses `on_error`, never retried (`.is_aborted()`).
+- `FlowError::Msg(String)` / `FlowError::User(Box<dyn Error>)` — user-code failures
+  (`FlowError::msg("boom")`, `FlowError::user(err)`).
+
+## TS → Rust quick mapping
+
+| TypeScript | Rust |
+|------------|------|
+| `shared: S`, `Prep`, `Out` | `serde_json::Value` |
+| `Action = string \| undefined` | `Action = Option<String>` |
+| `AbortController`/`AbortSignal` | `tokio_util::sync::CancellationToken` |
+| `console.warn` | `log::warn!` |
+| `class X extends Node` | `struct X { core: NodeCore }` + `impl FlowNode` + `impl_node_core!(core)` |
+| `new Node({ timeoutMs: 40, maxRetries: 2 })` | `NodeCore::with_opts(NodeOpts::new().timeout_ms(40).max_retries(2))` |
+| `new Flow(start, { maxSteps: 50 })` | `Flow::new(start).with_max_steps(50)` |
+| `flow.use({...})` | `flow.use_hooks(Arc::new(MyHooks))` |
+| `node.run(shared, { signal })` | `node_ref.run(&mut shared, Some(token))` |
+
+## Intentional divergences from the TS version
+
+- Losing a timeout/abort race **drops** the in-flight future (Rust cancellation)
+  instead of letting it settle in the background like a JS promise. A node that loses
+  the race never runs `post()` — that guarantee is identical.
+- Hooks receive `&Shared` (read-only), not the mutable context.
+- Abort reasons are not carried (`FlowError::Aborted` has no payload).
+- Node behaviors must be `Clone` (used for parallel `BatchFlow` graph cloning).
+- `exec_item` does not receive `shared` (same as TS); write results back in `post()`.
+- Rust futures are lazy: interleavings JS gets from the microtask queue may need an
+  explicit `tokio::task::yield_now().await`.
+
+## Best practices
+
+- Keep `exec` pure-ish and put context writes in `post`.
+- Add a tracing hook early (logging or OTel) — it's the cheapest way to see a flow run.
+- Use `on_error` + a recovery node instead of catching inside `exec`.
+- Set a realistic `max_steps` for any loop that involves model-driven routing.
+- `#[derive(Clone)]` on every node struct and use `impl_node_core!(core)`.
